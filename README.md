@@ -424,3 +424,99 @@ python run_baseline_lm.py \
 
 ## Contact
 If you have questions, please open an issue mentioning @AkariAsai or send an email to akari[at]cs.washington.edu.
+
+---
+
+## MAEDA Benchmark Integration
+
+This directory has been extended to support running Self-RAG as a baseline on the **MAEDA benchmark** (OpenROAD EDA domain QA). The integration adds data conversion, inference orchestration, post-processing, and evaluation scripts that connect Self-RAG's output to the MAEDA evaluator.
+
+### Why an external LLM API?
+
+The local Self-RAG model (`selfrag_llama2_7b`) is used for **answer generation**. The MAEDA **evaluator** (`evaluator.py`) is a separate component that uses an LLM API as a **judge** — it runs agents (Ret-Agent, SC-Agent, RF-Agent, Halluc-Agent) that call an LLM to detect retrieval errors, contradictions, missing information, and hallucinations in the generated answers. This evaluator LLM must be different from the generator, and is configured via `eval_config_selfrag.json`.
+
+### File Structure
+
+```
+baselines/self-rag/
+├── convert_maeda_to_selfrag.py   # Step 1: Convert MAEDA benchmark JSON → Self-RAG input JSONL
+├── run_selfrag_maeda.sh          # Main orchestration script (all 4 steps)
+├── postprocess_selfrag_output.py # Step 3: Convert Self-RAG output → MAEDA evaluator input
+├── eval_config_selfrag.json      # Step 4: MAEDA evaluator configuration (LLM API, paths)
+├── pyproject.toml                # Dependency spec for uv-based venv (alternative to conda)
+├── maeda_selfrag_data/           # Generated data directory
+│   ├── selfrag_input.json        # Self-RAG formatted input (from Step 1)
+│   └── selfrag_gt.json           # Ground truth data for evaluation
+├── results/                      # Inference & evaluation results
+│   ├── selfrag_raw_results.json  # Raw Self-RAG inference output (from Step 2)
+│   ├── selfrag_maeda_eval_input.json  # Post-processed output (from Step 3)
+│   └── selfrag_maeda_eval_result.json # Final evaluation results (from Step 4)
+└── retrieval_lm/                 # Original Self-RAG inference code
+    ├── run_short_form.py         # Short-form inference (modified for vllm 0.8+ compat)
+    ├── run_long_form_static.py   # Long-form inference
+    └── ...
+```
+
+### Pipeline Steps
+
+| Step | Script | Description |
+|------|--------|-------------|
+| 1. Convert | `convert_maeda_to_selfrag.py` | Parses MAEDA benchmark JSON, extracts `reranked_knowledge` into `ctxs` format, outputs Self-RAG input JSON |
+| 2. Inference | `run_short_form.py` (via shell script) | Runs Self-RAG adaptive retrieval inference with local 7B model |
+| 3. Post-process | `postprocess_selfrag_output.py` | Cleans reflection tokens, structures output as MAEDA evaluator input (with `input_answer`, `answer` fields) |
+| 4. Evaluate | `run_eval.py` (via shell script) | Runs MAEDA evaluator using external LLM API to judge answer quality |
+
+### Usage
+
+#### Prerequisites
+
+1. **Conda environment** (recommended): `conda activate huada_docqa_demo_release_v1` (includes `vllm`, `torch`, `transformers`, `spacy`)
+2. **Local model**: `/mnt/public/sichuan_a/nyt/models/Self-RAG/models/selfrag_llama2_7b`
+3. **GPU**: At least 15GB free VRAM (set `CUDA_VISIBLE_DEVICES` accordingly)
+
+#### Run full pipeline
+
+```bash
+conda activate huada_docqa_demo_release_v1
+bash run_selfrag_maeda.sh
+```
+
+#### Run individual steps
+
+```bash
+bash run_selfrag_maeda.sh convert      # Step 1 only
+bash run_selfrag_maeda.sh inference    # Step 2 only
+bash run_selfrag_maeda.sh postprocess  # Step 3 only
+bash run_selfrag_maeda.sh eval         # Step 4 only
+```
+
+#### Resume interrupted inference
+
+If inference is interrupted (e.g., vllm crash, OOM), it saves progress to `results/selfrag_raw_results.json_tmp` every 10 items. Resume with:
+
+```bash
+CUDA_VISIBLE_DEVICES=4 VLLM_WORKER_MULTIPROC_METHOD=spawn \
+  python3 retrieval_lm/run_short_form.py \
+    --model_name /mnt/public/sichuan_a/nyt/models/Self-RAG/models/selfrag_llama2_7b \
+    --input_file maeda_selfrag_data/selfrag_input.json \
+    --mode adaptive_retrieval --max_new_tokens 300 --threshold 0.2 \
+    --output_file results/selfrag_raw_results.json \
+    --metric match --ndocs 5 --use_groundness --use_utility --use_seqscore \
+    --dtype half --world_size 1 \
+    --resume_file results/selfrag_raw_results.json_tmp
+```
+
+### Key Configuration
+
+- **`run_selfrag_maeda.sh`**: Controls `MODEL_PATH`, `NDOCS`, `MAX_NEW_TOKENS`, `THRESHOLD`, `MODE`, `CUDA_VISIBLE_DEVICES`
+- **`eval_config_selfrag.json`**: Controls evaluator LLM API (`model`, `base_url`, `api_key`), input/output paths
+
+### Modifications to Original Self-RAG Code
+
+The following changes were made to `retrieval_lm/run_short_form.py` for vllm 0.8+ compatibility:
+
+- Added `_get_logprob()` helper to extract float from vllm `Logprob` objects (vllm >= 0.8 returns `Logprob` instead of raw float)
+- Added `max_logprobs=32016` to `LLM()` constructor (vllm >= 0.8 limits logprobs to 20 by default)
+- Added `enforce_eager=True` to `LLM()` constructor (avoids torch.compile-related msgspec DecodeError)
+- Added `--start_from` and `--resume_file` arguments for resuming interrupted inference
+- Removed invalid `max_depth` keyword argument from `call_model_rerank_w_scores_batch()` call

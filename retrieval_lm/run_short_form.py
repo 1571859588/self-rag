@@ -48,6 +48,12 @@ def postprocess_answer_option_conditioned(answer):
     return answer
 
 
+def _get_logprob(val):
+    """Extract float logprob from vllm Logprob object or raw float."""
+    if hasattr(val, 'logprob'):
+        return val.logprob
+    return float(val)
+
 def call_model_rerank_w_scores_batch(prompt, evidences, model, max_new_tokens=15,
                                      ret_tokens=None, rel_tokens=None, grd_tokens=None, ut_tokens=None,
                                      use_seqscore=False, threshold=0.5,
@@ -76,7 +82,7 @@ def call_model_rerank_w_scores_batch(prompt, evidences, model, max_new_tokens=15
                 if id not in pred_log_probs[0]:
                     score_dict[tok] = -100
                 prob = pred_log_probs[0][id]
-                score_dict[tok] = float(prob)
+                score_dict[tok] = _get_logprob(prob)
             do_retrieve = score_dict["[Retrieval]"] / (
                 score_dict["[Retrieval]"] + score_dict["[No Retrieval]"]) > threshold
         else:
@@ -106,7 +112,7 @@ def call_model_rerank_w_scores_batch(prompt, evidences, model, max_new_tokens=15
             # Compute reward scores
             for tok, id in rel_tokens.items():
                 prob = pred_log_probs[0][id] if id in pred_log_probs[0] else -100
-                relevance_score_dict[p_idx][tok] = np.exp(float(prob))
+                relevance_score_dict[p_idx][tok] = np.exp(_get_logprob(prob))
 
             if grd_tokens is not None:
                 groundness_token_appear_indices = []
@@ -118,7 +124,7 @@ def call_model_rerank_w_scores_batch(prompt, evidences, model, max_new_tokens=15
                     idx = groundness_token_appear_indices[0]
                     for token, token_id in grd_tokens.items():
                         prob = pred_log_probs[idx][token_id] if token_id in pred_log_probs[idx] else -100
-                        grd_score_dict[p_idx][token] = np.exp(float(prob))
+                        grd_score_dict[p_idx][token] = np.exp(_get_logprob(prob))
 
             if ut_tokens is not None:
                 utility_token_appear_indices = []
@@ -129,7 +135,7 @@ def call_model_rerank_w_scores_batch(prompt, evidences, model, max_new_tokens=15
                     idx = utility_token_appear_indices[0]
                     for token, token_id in ut_tokens.items():
                         prob = pred_log_probs[idx][token_id] if token_id in pred_log_probs[idx] else -100
-                        ut_score_dict[p_idx][token] = np.exp(float(prob))
+                        ut_score_dict[p_idx][token] = np.exp(_get_logprob(prob))
 
             relevance_score = relevance_score_dict[p_idx]["[Relevant]"] / (
                 np.sum(list(relevance_score_dict[p_idx].values())))
@@ -287,6 +293,10 @@ def main():
     parser.add_argument('--mode', type=str, help="mode to control retrieval.",
                         default="default", choices=['adaptive_retrieval', 'no_retrieval', 'always_retrieve'],)
     parser.add_argument('--metric', type=str, help="metric to be used during evaluation")
+    parser.add_argument('--start_from', type=int, default=0,
+                        help="Resume from this index (0-based)")
+    parser.add_argument('--resume_file', type=str, default=None,
+                        help="Resume from this tmp results file")
     args = parser.parse_args()
     gpt = args.model_name
     input_path = args.input_file
@@ -298,12 +308,9 @@ def main():
     input_data = preprocess_input_data(
         input_data, task=args.task)
     tokenizer = AutoTokenizer.from_pretrained(gpt, padding_side="left")
-    if args.dtype is not None:
-        model = LLM(model=gpt, download_dir=args.download_dir,
-                    dtype=args.dtype, tensor_parallel_size=args.world_size,)
-    else:
-        model = LLM(model=gpt, download_dir=args.download_dir,
-                    dtype=args.dtype, tensor_parallel_size=args.world_size,)
+    model = LLM(model=gpt, download_dir=args.download_dir,
+                dtype=args.dtype, tensor_parallel_size=args.world_size,
+                max_logprobs=32016, enforce_eager=True)
 
     # Get token ids for reflection tokens.
     ret_tokens, rel_tokens, grd_tokens, ut_tokens = load_special_tokens(
@@ -312,9 +319,10 @@ def main():
     def generate(prompt, evidences, max_new_tokens):
         return call_model_rerank_w_scores_batch(prompt, evidences=evidences, model=model, max_new_tokens=max_new_tokens,
                                                 rel_tokens=rel_tokens, ret_tokens=ret_tokens, grd_tokens=grd_tokens, ut_tokens=ut_tokens,
-                                                threshold=args.threshold, max_depth=args.max_depth, use_seqscore=args.use_seqscore,
+                                                threshold=args.threshold, use_seqscore=args.use_seqscore,
                                                 w_rel=args.w_rel, w_sup=args.w_sup, w_use=args.w_use, mode=args.mode, closed=args.task in ["fever", "arc_c"])
 
+    # Resume support
     preds = []
     prompts = []
     golds = []
@@ -322,7 +330,21 @@ def main():
     scores = []
     all_results = []
     count = 0
+    start_idx = args.start_from
+    if args.resume_file and os.path.exists(args.resume_file):
+        with open(args.resume_file) as f:
+            prev = json.load(f)
+        preds = prev.get("preds", [])
+        prompts = prev.get("prompts", [])
+        golds = prev.get("golds", [])
+        metric_results = prev.get("metric_results", [])
+        scores = prev.get("scores", [])
+        all_results = prev.get("all_results", [])
+        start_idx = len(preds)
+        print(f"Resuming from index {start_idx} (loaded from {args.resume_file})")
     for i, row in tqdm(enumerate(input_data)):
+        if i < start_idx:
+            continue
         results = {}
         prompt = PROMPT_DICT["prompt_no_input"].format_map(row)
         _, evidences = process_data_evidences(row, top_n=args.ndocs)

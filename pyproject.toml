@@ -1,0 +1,29 @@
+[project]
+name = "selfrag-maeda"
+version = "0.1.0"
+description = "Self-RAG baseline on MAEDA benchmark"
+requires-python = ">=3.10"
+dependencies = [
+    # Inference core
+    "vllm>=0.6.0",
+    "transformers>=4.40.0",
+    # Data / utils
+    "spacy",
+    "scikit-learn",
+    "jsonlines",
+    "tqdm",
+    "numpy",
+    "datasets",
+    "nltk",
+    "rouge-score",
+    "sacrebleu",
+    "sentencepiece",
+    "einops",
+    # Eval (openai for baseline scripts)
+    "openai>=1.0.0",
+    "tiktoken",
+]
+
+[tool.uv]
+# Avoid building flash-attn from source — vllm bundles its own
+constraint-dependencies = ["flash-attn==2.7.3"]
