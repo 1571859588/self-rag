@@ -435,6 +435,68 @@ This directory has been extended to support running Self-RAG as a baseline on th
 
 MAEDA evaluates the **entire RAG pipeline** (retriever + generator). Using the benchmark's pre-retrieved `reranked_knowledge` as context would be **cheating** — it gives the generator access to the "correct" retrieved documents, which is unfair for evaluating retrieval quality. Instead, we use a **fine-tuned BGE-large-en-v1.5** embedding model to build a FAISS index over the OpenROAD knowledge corpus and retrieve passages independently. This ensures a fair evaluation of both the retriever and the generator.
 
+### BGE Retrieval Details
+
+We use the **fine-tuned BGE-large-en-v1.5** model (based on `BAAI/bge-large-en-v1.5`, fine-tuned on OpenROAD domain data) as the embedding model for retrieval. This is the same model used in the main MAEDA RAG pipeline.
+
+**Model info:**
+- Base model: `BAAI/bge-large-en-v1.5` (335M parameters, 1024-dim embeddings)
+- Fine-tuned model path: `/mnt/public/sichuan_a/nyt/models/RAG-EDA/models/finetuned-models/embedding/bge-large-en-v1.5/output_flagembedding`
+- Fine-tuned on OpenROAD EDA domain data for better retrieval quality in this specific domain
+- Uses query instruction prefix: `"Represent this sentence for searching relevant passages: "` for encoding queries
+
+**How it works (`retrieve_with_bge.py`):**
+
+1. **Load corpus**: Reads `knowledge_openroad_MAEDA.json`, flattens each document's knowledge chunks into passages (with `source` as title, `summary + content` as text)
+2. **Build FAISS index**: Encodes all passages with BGE model (normalized embeddings), builds `IndexFlatIP` (inner product = cosine similarity for normalized vectors). Index is cached at `resources/faiss_bge_selfrag/` for reuse.
+3. **Retrieve**: For each query in the benchmark, encodes the query (with instruction prefix), searches FAISS for top-k nearest passages, returns results with scores.
+
+**Run BGE retrieval standalone:**
+
+```bash
+# Full retrieval (build index if not exists + retrieve for all queries)
+CUDA_VISIBLE_DEVICES=4 python3 retrieve_with_bge.py \
+    --corpus resources/knowledge_openroad_MAEDA.json \
+    --benchmark MAEDA-benchmark-300.json \
+    --model_name /mnt/public/sichuan_a/nyt/models/RAG-EDA/models/finetuned-models/embedding/bge-large-en-v1.5/output_flagembedding \
+    --index_dir resources/faiss_bge_selfrag \
+    --top_k 10 \
+    --output maeda_selfrag_data/bge_retrieval_results.json
+
+# Build FAISS index only (no retrieval, for later reuse)
+CUDA_VISIBLE_DEVICES=4 python3 retrieve_with_bge.py \
+    --corpus resources/knowledge_openroad_MAEDA.json \
+    --model_name /mnt/public/sichuan_a/nyt/models/RAG-EDA/models/finetuned-models/embedding/bge-large-en-v1.5/output_flagembedding \
+    --index_dir resources/faiss_bge_selfrag \
+    --build_index_only
+
+# Use a different GPU
+CUDA_VISIBLE_DEVICES=2 python3 retrieve_with_bge.py \
+    --corpus resources/knowledge_openroad_MAEDA.json \
+    --benchmark MAEDA-benchmark-300.json \
+    --device cuda:2 \
+    --top_k 5
+```
+
+**Key parameters:**
+- `--top_k`: Number of passages to retrieve per query (default 10; pipeline uses 10 for retrieval, then `--ndocs 5` selects top-5 for Self-RAG input)
+- `--batch_size`: Encoding batch size (default 64)
+- `--device`: GPU device for BGE model (auto-detected if not specified)
+
+**Output format** (`bge_retrieval_results.json`):
+```json
+[
+  {
+    "query_id": 1,
+    "question": "How to reduce WNS and TNS after placement?",
+    "retrieved_ctxs": [
+      {"title": "gate_resizing", "text": "...", "score": 0.87},
+      {"title": "rsz", "text": "...", "score": 0.72}
+    ]
+  }
+]
+```
+
 ### Why an external LLM API?
 
 The local Self-RAG model (`selfrag_llama2_7b`) is used for **answer generation**. The MAEDA **evaluator** (`evaluator.py`) is a separate component that uses an LLM API as a **judge** — it runs agents (Ret-Agent, SC-Agent, RF-Agent, Halluc-Agent) that call an LLM to detect retrieval errors, contradictions, missing information, and hallucinations in the generated answers. This evaluator LLM must be different from the generator, and is configured via `eval_config_selfrag.json`.
@@ -499,18 +561,6 @@ bash run_selfrag_maeda.sh postprocess  # Step 4 only
 bash run_selfrag_maeda.sh eval         # Step 5 only
 ```
 
-#### Build FAISS index only (without retrieval)
-
-If you just want to build the FAISS index for later use:
-
-```bash
-CUDA_VISIBLE_DEVICES=4 python3 retrieve_with_bge.py \
-    --corpus /path/to/knowledge_openroad_MAEDA.json \
-    --model_name /path/to/bge-large-en-v1.5/output_flagembedding \
-    --index_dir /path/to/faiss_bge_selfrag \
-    --build_index_only
-```
-
 #### Resume interrupted inference
 
 If inference is interrupted (e.g., vllm crash, OOM), it saves progress to `results/selfrag_raw_results.json_tmp` every 10 items. Resume with:
@@ -535,14 +585,23 @@ CUDA_VISIBLE_DEVICES=4 VLLM_WORKER_MULTIPROC_METHOD=spawn VLLM_USE_V1=0 \
 
 ### Evaluation Results (BGE Retrieval)
 
-| Metric | Value |
-|--------|-------|
-| Accuracy (judge=True) | 3.33% (10/300) |
-| Missing key points | 85.3% |
-| Retrieval errors | 30.3% |
-| Command hallucination | 23.0% |
-| Contradiction | 13.0% |
-| Example hallucination | 11.0% |
+| Metric | Agent | Value |
+|--------|-------|-------|
+| Accuracy (judge=True) | — | 3.33% (10/300) |
+| **Ret-Agent** | | |
+| Retrieval errors | Ret-Agent | 30.3% (91/300) |
+| **SC-Agent** | | |
+| Missing key points | SC-Agent | 85.3% (256/300) |
+| Contradiction | SC-Agent | 13.0% (39/300) |
+| **RF-Agent** | | |
+| Incorrect refusal | RF-Agent | 0.0% (0/300) |
+| Incorrect non-refusal | RF-Agent | 0.0% (0/300) |
+| **Halluc-Agent** | | |
+| Command hallucination | Halluc-Agent | 23.0% (69/300) |
+| Example hallucination | Halluc-Agent | 11.0% (33/300) |
+
+- `incorrect_refusal` / `incorrect_non_refusal` 为 0 是因为 Self-RAG 不会拒答（它总是尝试生成答案）
+- 幻觉指令 Top-5: `swap_master`(7), `make_io_sites`(6), `place_io_pins`(6), `check_for_conflicts`(6), `resolve_conflicts`(6)
 
 ### Modifications to Original Self-RAG Code
 
