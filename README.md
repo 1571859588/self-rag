@@ -429,7 +429,11 @@ If you have questions, please open an issue mentioning @AkariAsai or send an ema
 
 ## MAEDA Benchmark Integration
 
-This directory has been extended to support running Self-RAG as a baseline on the **MAEDA benchmark** (OpenROAD EDA domain QA). The integration adds data conversion, inference orchestration, post-processing, and evaluation scripts that connect Self-RAG's output to the MAEDA evaluator.
+This directory has been extended to support running Self-RAG as a baseline on the **MAEDA benchmark** (OpenROAD EDA domain QA). The integration adds BGE-based retrieval, data conversion, inference orchestration, post-processing, and evaluation scripts that connect Self-RAG's output to the MAEDA evaluator.
+
+### Why BGE Retrieval instead of `reranked_knowledge`?
+
+MAEDA evaluates the **entire RAG pipeline** (retriever + generator). Using the benchmark's pre-retrieved `reranked_knowledge` as context would be **cheating** — it gives the generator access to the "correct" retrieved documents, which is unfair for evaluating retrieval quality. Instead, we use a **fine-tuned BGE-large-en-v1.5** embedding model to build a FAISS index over the OpenROAD knowledge corpus and retrieve passages independently. This ensures a fair evaluation of both the retriever and the generator.
 
 ### Why an external LLM API?
 
@@ -439,18 +443,20 @@ The local Self-RAG model (`selfrag_llama2_7b`) is used for **answer generation**
 
 ```
 baselines/self-rag/
-├── convert_maeda_to_selfrag.py   # Step 1: Convert MAEDA benchmark JSON → Self-RAG input JSONL
-├── run_selfrag_maeda.sh          # Main orchestration script (all 4 steps)
-├── postprocess_selfrag_output.py # Step 3: Convert Self-RAG output → MAEDA evaluator input
-├── eval_config_selfrag.json      # Step 4: MAEDA evaluator configuration (LLM API, paths)
+├── retrieve_with_bge.py          # Step 1: BGE embedding + FAISS retrieval for OpenROAD corpus
+├── convert_maeda_to_selfrag.py   # Step 2: Convert MAEDA benchmark JSON → Self-RAG input (with BGE ctxs)
+├── run_selfrag_maeda.sh          # Main orchestration script (all 5 steps)
+├── postprocess_selfrag_output.py # Step 4: Convert Self-RAG output → MAEDA evaluator input
+├── eval_config_selfrag.json      # Step 5: MAEDA evaluator configuration (LLM API, paths)
 ├── pyproject.toml                # Dependency spec for uv-based venv (alternative to conda)
 ├── maeda_selfrag_data/           # Generated data directory
-│   ├── selfrag_input.json        # Self-RAG formatted input (from Step 1)
+│   ├── bge_retrieval_results.json  # BGE retrieval results per query (from Step 1)
+│   ├── selfrag_input.json        # Self-RAG formatted input (from Step 2)
 │   └── selfrag_gt.json           # Ground truth data for evaluation
 ├── results/                      # Inference & evaluation results
-│   ├── selfrag_raw_results.json  # Raw Self-RAG inference output (from Step 2)
-│   ├── selfrag_maeda_eval_input.json  # Post-processed output (from Step 3)
-│   └── selfrag_maeda_eval_result.json # Final evaluation results (from Step 4)
+│   ├── selfrag_raw_results.json  # Raw Self-RAG inference output (from Step 3)
+│   ├── selfrag_maeda_eval_input.json  # Post-processed output (from Step 4)
+│   └── selfrag_maeda_eval_result.json # Final evaluation results (from Step 5)
 └── retrieval_lm/                 # Original Self-RAG inference code
     ├── run_short_form.py         # Short-form inference (modified for vllm 0.8+ compat)
     ├── run_long_form_static.py   # Long-form inference
@@ -461,33 +467,48 @@ baselines/self-rag/
 
 | Step | Script | Description |
 |------|--------|-------------|
-| 1. Convert | `convert_maeda_to_selfrag.py` | Parses MAEDA benchmark JSON, extracts `reranked_knowledge` into `ctxs` format, outputs Self-RAG input JSON |
-| 2. Inference | `run_short_form.py` (via shell script) | Runs Self-RAG adaptive retrieval inference with local 7B model |
-| 3. Post-process | `postprocess_selfrag_output.py` | Cleans reflection tokens, structures output as MAEDA evaluator input (with `input_answer`, `answer` fields) |
-| 4. Evaluate | `run_eval.py` (via shell script) | Runs MAEDA evaluator using external LLM API to judge answer quality |
+| 1. Retrieve | `retrieve_with_bge.py` | Loads OpenROAD corpus, builds/loads FAISS index with BGE embeddings, retrieves top-k passages per query |
+| 2. Convert | `convert_maeda_to_selfrag.py` | Parses MAEDA benchmark JSON, uses BGE retrieval results as `ctxs`, outputs Self-RAG input JSON |
+| 3. Inference | `run_short_form.py` (via shell script) | Runs Self-RAG adaptive retrieval inference with local 7B model |
+| 4. Post-process | `postprocess_selfrag_output.py` | Cleans reflection tokens, structures output as MAEDA evaluator input |
+| 5. Evaluate | `run_eval.py` (via shell script) | Runs MAEDA evaluator using external LLM API to judge answer quality |
 
 ### Usage
 
 #### Prerequisites
 
-1. **Conda environment** (recommended): `conda activate huada_docqa_demo_release_v1` (includes `vllm`, `torch`, `transformers`, `spacy`)
-2. **Local model**: `/mnt/public/sichuan_a/nyt/models/Self-RAG/models/selfrag_llama2_7b`
-3. **GPU**: At least 15GB free VRAM (set `CUDA_VISIBLE_DEVICES` accordingly)
+1. **Conda environment** (recommended): `conda activate huada_docqa_demo_release_v1` (includes `vllm`, `torch`, `transformers`, `spacy`, `sentence_transformers`, `faiss`)
+2. **Local generator model**: `/mnt/public/sichuan_a/nyt/models/Self-RAG/models/selfrag_llama2_7b`
+3. **BGE embedding model**: `/mnt/public/sichuan_a/nyt/models/RAG-EDA/models/finetuned-models/embedding/bge-large-en-v1.5/output_flagembedding`
+4. **GPU**: At least 15GB free VRAM for inference; retrieval step also needs a GPU for BGE encoding
 
 #### Run full pipeline
 
 ```bash
 conda activate huada_docqa_demo_release_v1
-bash run_selfrag_maeda.sh
+CUDA_VISIBLE_DEVICES=4 bash run_selfrag_maeda.sh
 ```
 
 #### Run individual steps
 
 ```bash
-bash run_selfrag_maeda.sh convert      # Step 1 only
-bash run_selfrag_maeda.sh inference    # Step 2 only
-bash run_selfrag_maeda.sh postprocess  # Step 3 only
-bash run_selfrag_maeda.sh eval         # Step 4 only
+bash run_selfrag_maeda.sh retrieve     # Step 1 only (BGE retrieval)
+bash run_selfrag_maeda.sh convert      # Step 2 only (data conversion)
+bash run_selfrag_maeda.sh inference    # Step 3 only (Self-RAG inference)
+bash run_selfrag_maeda.sh postprocess  # Step 4 only
+bash run_selfrag_maeda.sh eval         # Step 5 only
+```
+
+#### Build FAISS index only (without retrieval)
+
+If you just want to build the FAISS index for later use:
+
+```bash
+CUDA_VISIBLE_DEVICES=4 python3 retrieve_with_bge.py \
+    --corpus /path/to/knowledge_openroad_MAEDA.json \
+    --model_name /path/to/bge-large-en-v1.5/output_flagembedding \
+    --index_dir /path/to/faiss_bge_selfrag \
+    --build_index_only
 ```
 
 #### Resume interrupted inference
@@ -495,7 +516,7 @@ bash run_selfrag_maeda.sh eval         # Step 4 only
 If inference is interrupted (e.g., vllm crash, OOM), it saves progress to `results/selfrag_raw_results.json_tmp` every 10 items. Resume with:
 
 ```bash
-CUDA_VISIBLE_DEVICES=4 VLLM_WORKER_MULTIPROC_METHOD=spawn \
+CUDA_VISIBLE_DEVICES=4 VLLM_WORKER_MULTIPROC_METHOD=spawn VLLM_USE_V1=0 \
   python3 retrieval_lm/run_short_form.py \
     --model_name /mnt/public/sichuan_a/nyt/models/Self-RAG/models/selfrag_llama2_7b \
     --input_file maeda_selfrag_data/selfrag_input.json \
@@ -508,8 +529,20 @@ CUDA_VISIBLE_DEVICES=4 VLLM_WORKER_MULTIPROC_METHOD=spawn \
 
 ### Key Configuration
 
-- **`run_selfrag_maeda.sh`**: Controls `MODEL_PATH`, `NDOCS`, `MAX_NEW_TOKENS`, `THRESHOLD`, `MODE`, `CUDA_VISIBLE_DEVICES`
+- **`run_selfrag_maeda.sh`**: Controls `MODEL_PATH`, `BGE_MODEL_PATH`, `CORPUS_PATH`, `FAISS_INDEX_DIR`, `NDOCS`, `RETRIEVAL_TOPK`, `MAX_NEW_TOKENS`, `THRESHOLD`, `MODE`, `CUDA_VISIBLE_DEVICES`
 - **`eval_config_selfrag.json`**: Controls evaluator LLM API (`model`, `base_url`, `api_key`), input/output paths
+- **`convert_maeda_to_selfrag.py`**: Accepts `--retrieval_results` for BGE output; without it, falls back to `reranked_knowledge` (CHEATING)
+
+### Evaluation Results (BGE Retrieval)
+
+| Metric | Value |
+|--------|-------|
+| Accuracy (judge=True) | 3.33% (10/300) |
+| Missing key points | 85.3% |
+| Retrieval errors | 30.3% |
+| Command hallucination | 23.0% |
+| Contradiction | 13.0% |
+| Example hallucination | 11.0% |
 
 ### Modifications to Original Self-RAG Code
 
@@ -520,3 +553,4 @@ The following changes were made to `retrieval_lm/run_short_form.py` for vllm 0.8
 - Added `enforce_eager=True` to `LLM()` constructor (avoids torch.compile-related msgspec DecodeError)
 - Added `--start_from` and `--resume_file` arguments for resuming interrupted inference
 - Removed invalid `max_depth` keyword argument from `call_model_rerank_w_scores_batch()` call
+- Set `VLLM_USE_V1=0` to disable v1 engine (has msgspec serialization bug with large logprobs: `ValidationError: Expected 'float', got 'array'`)

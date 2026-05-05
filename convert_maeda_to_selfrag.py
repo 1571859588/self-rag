@@ -9,6 +9,10 @@ MAEDA benchmark format:
 Self-RAG input format (for run_short_form.py with pre-retrieved docs):
   - instruction (or question), ctxs: [{title, text}], answers
 
+Two modes:
+  1. With --retrieval_results: Uses BGE-retrieved passages (fair evaluation)
+  2. Without --retrieval_results: Falls back to benchmark's reranked_knowledge (CHEATING)
+
 Output:
   1. selfrag_input.json  — for Self-RAG inference
   2. selfrag_gt.json     — for MAEDA evaluator (preserves all original fields)
@@ -70,21 +74,40 @@ def parse_reranked_knowledge(rk_text: str) -> list:
     return ctxs
 
 
-def convert(input_path: str, output_dir: str, ndocs: int = 10):
+def convert(input_path: str, output_dir: str, ndocs: int = 10,
+           retrieval_results_path: str = None):
     os.makedirs(output_dir, exist_ok=True)
 
     with open(input_path, 'r', encoding='utf-8') as f:
         benchmark_data = json.load(f)
+
+    # Load retrieval results if provided
+    retrieval_map = None
+    if retrieval_results_path:
+        with open(retrieval_results_path, 'r', encoding='utf-8') as f:
+            retrieval_data = json.load(f)
+        # Map query_id -> retrieved ctxs
+        retrieval_map = {}
+        for item in retrieval_data:
+            qid = item.get("query_id", 0)
+            retrieval_map[qid] = item["retrieved_ctxs"]
+        print(f"Loaded BGE retrieval results for {len(retrieval_map)} queries from {retrieval_results_path}")
 
     selfrag_data = []
     gt_data = []
 
     for item in benchmark_data:
         question = item["question"]
+        query_id = item.get("query_id", 0)
         rk_text = item.get("reranked_knowledge", "")
-        ctxs = parse_reranked_knowledge(rk_text)
-        # Limit to top-ndocs
-        ctxs = ctxs[:ndocs]
+
+        # Use BGE retrieval results if available, otherwise fall back to reranked_knowledge
+        if retrieval_map and query_id in retrieval_map:
+            ctxs = retrieval_map[query_id][:ndocs]
+            retrieval_source = "BGE"
+        else:
+            ctxs = parse_reranked_knowledge(rk_text)[:ndocs]
+            retrieval_source = "reranked_knowledge"
 
         # Self-RAG format
         selfrag_item = {
@@ -92,13 +115,13 @@ def convert(input_path: str, output_dir: str, ndocs: int = 10):
             "question": question,
             "ctxs": ctxs,
             "answers": [item.get("gt_answer", "")],
-            "query_id": item.get("query_id", 0),
+            "query_id": query_id,
         }
         selfrag_data.append(selfrag_item)
 
         # GT data for MAEDA evaluator (preserved original fields)
         gt_item = {
-            "query_id": item.get("query_id", 0),
+            "query_id": query_id,
             "question": question,
             "gt_answer": item.get("gt_answer", ""),
             "gt_answer_points": item.get("gt_answer_points", []),
@@ -119,7 +142,7 @@ def convert(input_path: str, output_dir: str, ndocs: int = 10):
     with open(gt_path, 'w', encoding='utf-8') as f:
         json.dump(gt_data, f, indent=2, ensure_ascii=False)
 
-    print(f"Converted {len(benchmark_data)} items")
+    print(f"Converted {len(benchmark_data)} items (retrieval: {retrieval_source})")
     print(f"  Self-RAG input: {selfrag_path}")
     print(f"  GT data:        {gt_path}")
 
@@ -140,5 +163,8 @@ if __name__ == "__main__":
                         help="Output directory")
     parser.add_argument("--ndocs", type=int, default=10,
                         help="Number of docs per question to include")
+    parser.add_argument("--retrieval_results", type=str, default=None,
+                        help="Path to BGE retrieval results JSON (from retrieve_with_bge.py). "
+                             "If not provided, falls back to benchmark's reranked_knowledge (CHEATING).")
     args = parser.parse_args()
-    convert(args.input, args.output_dir, args.ndocs)
+    convert(args.input, args.output_dir, args.ndocs, args.retrieval_results)
